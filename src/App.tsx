@@ -37,6 +37,7 @@ type ThemeMode = 'dark' | 'light'
 type ReaderMode = 'regular' | 'immersive' | 'focus'
 type LineHeight = 'compact' | 'standard' | 'relaxed'
 type BookFormat = 'demo' | 'txt' | 'md'
+type ImportTone = 'info' | 'success' | 'error'
 
 interface DetectionResult {
   type: BookGenre
@@ -509,18 +510,26 @@ function App() {
   const [selectedBookId, setSelectedBookId] = useState(initialStorage.selectedBookId)
   const [settingsByBook, setSettingsByBook] = useState<Record<string, ReaderSettings>>(initialStorage.settingsByBook)
   const [progressByBook, setProgressByBook] = useState<Record<string, ReadingProgress>>(initialStorage.progressByBook)
-  const [importStatus, setImportStatus] = useState('本地 TXT / Markdown 可直接打开；正文不会上传。')
+  const [importStatus, setImportStatus] = useState<{ tone: ImportTone; text: string }>({
+    tone: 'info',
+    text: '本地 TXT / Markdown 可直接打开；正文不会上传。',
+  })
+  const [persistenceStatus, setPersistenceStatus] = useState<{ tone: ImportTone; text: string } | null>(null)
+  const [modeAnnouncement, setModeAnnouncement] = useState('常规阅读模式。')
   const [pendingIntensity, setPendingIntensity] = useState<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const modeExitRef = useRef<HTMLButtonElement | null>(null)
   const readingSurfaceRef = useRef<HTMLDivElement | null>(null)
   const progressSaveRef = useRef<number | null>(null)
+  const previousModeRef = useRef<ReaderMode>(DEFAULT_SETTINGS.mode)
 
   const books = useMemo(() => [...sampleBooks, ...importedBooks], [importedBooks])
   const selectedBook = useMemo(() => books.find((book) => book.id === selectedBookId) ?? books[0], [books, selectedBookId])
   const settings = settingsByBook[selectedBook.id] ?? getPreferenceDefaults()
   const progress = progressByBook[selectedBook.id]
   const progressPercent = getBookProgress(selectedBook, progress)
+  const savedScrollTop = progress?.scrollTop ?? 0
   const selectedGenre = useMemo(() => {
     const detected = selectedBook.detection.confidence >= 0.7 ? selectedBook.detection.type : selectedBook.detection.fallbackType
     return settings.followType ? detected : settings.manualType ?? detected
@@ -546,8 +555,13 @@ function App() {
     }
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
+      setPersistenceStatus((current) => (current?.tone === 'error' ? { tone: 'success', text: '本机阅读进度已恢复保存。' } : current))
     } catch (error) {
       console.warn('Unable to persist local reader state', error)
+      setPersistenceStatus({
+        tone: 'error',
+        text: '本机阅读进度暂时无法保存，请检查浏览器存储权限或可用空间。',
+      })
     }
   }, [importedBooks, progressByBook, selectedBookId, settingsByBook])
 
@@ -557,15 +571,28 @@ function App() {
       return
     }
     window.setTimeout(() => {
-      surface.scrollTop = progressByBook[selectedBook.id]?.scrollTop ?? 0
+      surface.scrollTop = savedScrollTop
     }, 0)
-  }, [progressByBook, selectedBook.id])
+  }, [savedScrollTop, selectedBook.id])
+
+  useEffect(() => {
+    if (previousModeRef.current === settings.mode) {
+      return
+    }
+    previousModeRef.current = settings.mode
+    if (settings.mode === 'regular') {
+      setModeAnnouncement('已返回常规阅读模式。')
+      window.setTimeout(() => readingSurfaceRef.current?.focus(), 0)
+      return
+    }
+    setModeAnnouncement(settings.mode === 'focus' ? '已进入专注模式，焦点已移至退出专注按钮。' : '已进入沉浸模式，焦点已移至退出沉浸按钮。')
+    window.setTimeout(() => modeExitRef.current?.focus(), 0)
+  }, [settings.mode])
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape' && settings.mode !== 'regular') {
-        updateSetting('mode', 'regular')
-        readingSurfaceRef.current?.focus()
+        exitReaderMode()
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -586,6 +613,9 @@ function App() {
   }
 
   function chooseManualType(type: BookGenre) {
+    if (!isGenre(type)) {
+      return
+    }
     setSettingsByBook((current) => ({
       ...current,
       [selectedBook.id]: sanitizeSettings(
@@ -597,6 +627,14 @@ function App() {
         getPreferenceDefaults().reducedMotion,
       ),
     }))
+  }
+
+  function exitReaderMode() {
+    updateSetting('mode', 'regular')
+  }
+
+  function setImportMessage(tone: ImportTone, text: string) {
+    setImportStatus({ tone, text })
   }
 
   function handleIntensityChange(value: number) {
@@ -646,17 +684,17 @@ function App() {
     for (const file of nextFiles) {
       const extension = file.name.split('.').pop()?.toLowerCase()
       if (extension !== 'txt' && extension !== 'md' && extension !== 'markdown') {
-        setImportStatus(`无法打开 ${file.name}：当前本机解析仅支持 .txt、.md、.markdown；EPUB 将作为后续本地解析能力。`)
+        setImportMessage('error', `无法打开 ${file.name}：当前本机解析仅支持 .txt、.md、.markdown；EPUB 将作为后续本地解析能力。`)
         continue
       }
       if (file.size > MAX_LOCAL_FILE_SIZE) {
-        setImportStatus(`无法打开 ${file.name}：文件超过 2.5MB，避免本地原型卡顿。`)
+        setImportMessage('error', `无法打开 ${file.name}：文件超过 2.5MB，避免本地原型卡顿。`)
         continue
       }
       const rawText = await file.text()
       const content = extension === 'txt' ? rawText : parseMarkdown(rawText)
       if (!content.trim()) {
-        setImportStatus(`无法打开 ${file.name}：文件为空或没有可读正文。`)
+        setImportMessage('error', `无法打开 ${file.name}：文件为空或没有可读正文。`)
         continue
       }
       const title = file.name.replace(/\.(txt|md|markdown)$/i, '')
@@ -697,7 +735,7 @@ function App() {
         parsedBooks.map((book) => [book.id, { scrollTop: 0, percent: 0, chapterProgress: 0, updatedAt: new Date().toISOString() }]),
       ),
     }))
-    setImportStatus(`已在本机打开 ${parsedBooks.length} 本书：${parsedBooks.map((book) => book.title).join('、')}。`)
+    setImportMessage('success', `已在本机打开 ${parsedBooks.length} 本书：${parsedBooks.map((book) => book.title).join('、')}。`)
   }
 
   const appStyle = {
@@ -741,6 +779,8 @@ function App() {
         type="file"
         accept=".txt,.md,.markdown,text/plain,text/markdown"
         multiple
+        tabIndex={-1}
+        aria-hidden="true"
         onChange={(event) => {
           if (event.target.files) {
             void importFiles(event.target.files)
@@ -750,11 +790,14 @@ function App() {
       />
 
       {settings.mode !== 'regular' && (
-        <button type="button" className="mode-exit" onClick={() => updateSetting('mode', 'regular')}>
+        <button ref={modeExitRef} type="button" className="mode-exit" onClick={exitReaderMode}>
           <X size={18} aria-hidden="true" />
           <span>退出{settings.mode === 'focus' ? '专注' : '沉浸'}</span>
         </button>
       )}
+      <p className="sr-only" role="status" aria-live="polite">
+        {modeAnnouncement}
+      </p>
 
       <aside className="library-rail" aria-label="书架导航">
         <div className="brand">
@@ -848,7 +891,7 @@ function App() {
               {settings.motionEnabled ? <Pause size={19} aria-hidden="true" /> : <Play size={19} aria-hidden="true" />}
             </button>
             {settings.mode !== 'regular' ? (
-              <button type="button" className="exit-button" onClick={() => updateSetting('mode', 'regular')}>
+              <button type="button" className="exit-button" onClick={exitReaderMode}>
                 退出
               </button>
             ) : (
@@ -887,9 +930,14 @@ function App() {
             <Upload size={20} aria-hidden="true" />
             <span>选择 TXT / Markdown</span>
           </button>
-          <p className="hint" role="status" aria-live="polite">
-            {importStatus}
+          <p className={`hint ${importStatus.tone === 'error' ? 'strong' : ''}`} role={importStatus.tone === 'error' ? 'alert' : 'status'} aria-live={importStatus.tone === 'error' ? 'assertive' : 'polite'}>
+            {importStatus.text}
           </p>
+          {persistenceStatus && (
+            <p className={`hint ${persistenceStatus.tone === 'error' ? 'strong' : ''}`} role={persistenceStatus.tone === 'error' ? 'alert' : 'status'} aria-live={persistenceStatus.tone === 'error' ? 'assertive' : 'polite'}>
+              {persistenceStatus.text}
+            </p>
+          )}
         </PanelSection>
 
         <PanelSection title="正在阅读">

@@ -515,7 +515,6 @@ function App() {
     text: '本地 TXT / Markdown 可直接打开；正文不会上传。',
   })
   const [persistenceStatus, setPersistenceStatus] = useState<{ tone: ImportTone; text: string } | null>(null)
-  const [modeAnnouncement, setModeAnnouncement] = useState('常规阅读模式。')
   const [pendingIntensity, setPendingIntensity] = useState<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -544,6 +543,12 @@ function App() {
   const motionIntensity = settings.motionEnabled ? (settings.reducedMotion ? Math.min(effectiveIntensity, 5) : effectiveIntensity) : 0
   const isQuiet = !settings.motionEnabled || settings.reducedMotion || motionIntensity <= 5
   const intensityLabel = !settings.motionEnabled ? '已暂停' : settings.reducedMotion ? `生效 ${motionIntensity}%` : `${effectiveIntensity}%`
+  const modeAnnouncement =
+    settings.mode === 'regular'
+      ? '已返回常规阅读模式。'
+      : settings.mode === 'focus'
+        ? '已进入专注模式，焦点已移至退出专注按钮。'
+        : '已进入沉浸模式，焦点已移至退出沉浸按钮。'
 
   useEffect(() => {
     const payload: ReaderStorage = {
@@ -555,13 +560,17 @@ function App() {
     }
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
-      setPersistenceStatus((current) => (current?.tone === 'error' ? { tone: 'success', text: '本机阅读进度已恢复保存。' } : current))
+      window.setTimeout(() => {
+        setPersistenceStatus((current) => (current?.tone === 'error' ? { tone: 'success', text: '本机阅读进度已恢复保存。' } : current))
+      }, 0)
     } catch (error) {
       console.warn('Unable to persist local reader state', error)
-      setPersistenceStatus({
-        tone: 'error',
-        text: '本机阅读进度暂时无法保存，请检查浏览器存储权限或可用空间。',
-      })
+      window.setTimeout(() => {
+        setPersistenceStatus({
+          tone: 'error',
+          text: '本机阅读进度暂时无法保存，请检查浏览器存储权限或可用空间。',
+        })
+      }, 0)
     }
   }, [importedBooks, progressByBook, selectedBookId, settingsByBook])
 
@@ -581,11 +590,9 @@ function App() {
     }
     previousModeRef.current = settings.mode
     if (settings.mode === 'regular') {
-      setModeAnnouncement('已返回常规阅读模式。')
       window.setTimeout(() => readingSurfaceRef.current?.focus(), 0)
       return
     }
-    setModeAnnouncement(settings.mode === 'focus' ? '已进入专注模式，焦点已移至退出专注按钮。' : '已进入沉浸模式，焦点已移至退出沉浸按钮。')
     window.setTimeout(() => modeExitRef.current?.focus(), 0)
   }, [settings.mode])
 
@@ -790,7 +797,13 @@ function App() {
       />
 
       {settings.mode !== 'regular' && (
-        <button ref={modeExitRef} type="button" className="mode-exit" onClick={exitReaderMode}>
+        <button
+          ref={modeExitRef}
+          type="button"
+          className="mode-exit"
+          aria-label={`退出${settings.mode === 'focus' ? '专注' : '沉浸'}模式`}
+          onClick={exitReaderMode}
+        >
           <X size={18} aria-hidden="true" />
           <span>退出{settings.mode === 'focus' ? '专注' : '沉浸'}</span>
         </button>

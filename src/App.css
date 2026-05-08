@@ -1222,10 +1222,22 @@ input:focus-visible {
     margin: 0 14px 18px;
   }
 
-  .mode-exit {
+  .reader-app.mode-immersive .mode-exit {
     top: auto;
     right: 14px;
     bottom: 88px;
+  }
+
+  .reader-app.mode-focus .mode-exit {
+    position: static;
+    justify-self: end;
+    align-self: start;
+    margin: calc(env(safe-area-inset-top, 0px) + 10px) 14px 0;
+  }
+
+  .reader-app.mode-focus .reader-stage {
+    min-height: auto;
+    padding-top: 10px;
   }
 }
 

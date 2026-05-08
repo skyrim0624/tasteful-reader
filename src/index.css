@@ -1,9 +1,15 @@
+@import '@fontsource/noto-sans-sc/chinese-simplified-400.css';
+@import '@fontsource/noto-sans-sc/chinese-simplified-500.css';
+@import '@fontsource/noto-sans-sc/chinese-simplified-700.css';
+@import '@fontsource/noto-serif-sc/chinese-simplified-400.css';
+@import '@fontsource/noto-serif-sc/chinese-simplified-700.css';
+
 :root {
   --ui-font:
-    'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', 'Source Han Sans SC',
+    'Noto Sans SC', 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', 'Source Han Sans SC',
     system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --reader-serif:
-    'Songti SC', 'Noto Serif CJK SC', 'Source Han Serif SC', 'SimSun', serif;
+    'Noto Serif SC', 'Songti SC', 'Noto Serif CJK SC', 'Source Han Serif SC', 'SimSun', serif;
   font-family:
     var(--ui-font);
   color: #3a3731;

@@ -383,7 +383,7 @@
   max-height: calc(100vh - 148px);
   z-index: 2;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--genre-accent) 28%, var(--line));
   border-radius: 8px;
@@ -558,6 +558,101 @@
 
 .reading-surface p + p {
   margin-top: 26px;
+}
+
+.epub-chapter h2 {
+  margin: 38px 0 18px;
+  color: var(--reader-text);
+  font-family: var(--reader-serif);
+  font-size: calc(var(--reader-font-size) + 7px);
+  line-height: 1.34;
+}
+
+.epub-chapter :is(p, blockquote, li) {
+  color: color-mix(in srgb, var(--reader-text) 90%, var(--reader-muted));
+  font-family: var(--reader-serif);
+  font-size: var(--reader-font-size);
+  line-height: var(--line-height);
+}
+
+.epub-chapter :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--reader-text);
+  font-family: var(--reader-serif);
+  line-height: 1.38;
+}
+
+.epub-chapter img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 24px auto;
+}
+
+.epub-chapter table,
+.epub-chapter pre {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.chapter-drawer {
+  margin: 0 clamp(20px, 4vw, 42px) 14px;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--reader-text);
+  background: rgba(9, 15, 22, 0.82);
+}
+
+.theme-light .chapter-drawer {
+  color: #222831;
+  background: rgba(255, 251, 242, 0.9);
+}
+
+.chapter-drawer-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--reader-muted);
+  font-size: 13px;
+}
+
+.chapter-drawer-meta strong {
+  color: var(--reader-text);
+}
+
+.chapter-list {
+  max-height: min(32vh, 300px);
+  overflow: auto;
+  display: grid;
+  gap: 6px;
+}
+
+.chapter-list button {
+  min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+  text-align: left;
+}
+
+.chapter-list button.is-active,
+.chapter-list button:hover,
+.chapter-list button:focus-visible {
+  border-color: color-mix(in srgb, var(--genre-accent) 54%, transparent);
+  background: color-mix(in srgb, var(--genre-accent) 16%, rgba(255, 255, 255, 0.06));
+}
+
+.chapter-list span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ambient-dock {

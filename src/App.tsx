@@ -17,6 +17,8 @@ import type { CSSProperties, ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import { parseEpubFile } from './epub'
+import type { EpubTocItem, EpubTocSource } from './epub'
 
 type BookGenre =
   | '文学小说'
@@ -36,7 +38,7 @@ type BookGenre =
 type ThemeMode = 'dark' | 'light'
 type ReaderMode = 'regular' | 'immersive' | 'focus'
 type LineHeight = 'compact' | 'standard' | 'relaxed'
-type BookFormat = 'demo' | 'txt' | 'md'
+type BookFormat = 'demo' | 'txt' | 'md' | 'epub'
 type ImportTone = 'info' | 'success' | 'error'
 
 interface DetectionResult {
@@ -57,9 +59,13 @@ interface Book {
   detection: DetectionResult
   excerpt: string
   chapters: string[]
+  chapterHtmls?: string[]
+  toc?: EpubTocItem[]
+  tocSource?: EpubTocSource
   format: BookFormat
   fileName?: string
   fileSize?: number
+  fileFingerprint?: string
   importedAt?: string
 }
 
@@ -79,6 +85,8 @@ interface ReadingProgress {
   scrollTop: number
   percent: number
   chapterProgress: number
+  spineIndex?: number
+  chapterHref?: string
   updatedAt: string
 }
 
@@ -104,7 +112,8 @@ const DEFAULT_SETTINGS: ReaderSettings = {
 
 const STORAGE_KEY = 'wanman-premium-reader-local-v2'
 const LEGACY_STORAGE_KEY = 'wanman-premium-reader-settings-v1'
-const MAX_LOCAL_FILE_SIZE = 2.5 * 1024 * 1024
+const MAX_TEXT_FILE_SIZE = 2.5 * 1024 * 1024
+const MAX_EPUB_FILE_SIZE = 60 * 1024 * 1024
 const HIGH_INTENSITY_THRESHOLD = 55
 
 const genrePresets: Record<
@@ -331,6 +340,8 @@ function sanitizeProgress(input: unknown): ReadingProgress {
     scrollTop: clampNumber(source.scrollTop, 0, 999999, 0),
     percent: clampNumber(source.percent, 0, 100, 0),
     chapterProgress: clampNumber(source.chapterProgress, 0, 100, 0),
+    spineIndex: typeof source.spineIndex === 'number' ? Math.max(0, Math.floor(source.spineIndex)) : undefined,
+    chapterHref: typeof source.chapterHref === 'string' ? source.chapterHref : undefined,
     updatedAt: typeof source.updatedAt === 'string' ? source.updatedAt : new Date().toISOString(),
   }
 }
@@ -348,6 +359,19 @@ function sanitizeBook(input: unknown): Book | null {
     return null
   }
   const detection = source.detection
+  const safeToc = Array.isArray(source.toc)
+    ? source.toc
+        .filter((item): item is EpubTocItem => Boolean(item) && typeof item === 'object' && typeof item.label === 'string' && typeof item.href === 'string')
+        .map((item, order) => ({
+          id: typeof item.id === 'string' ? item.id : `toc-${order}`,
+          label: item.label,
+          href: item.href,
+          spineIndex: clampNumber(item.spineIndex, 0, chapters.length - 1, 0),
+          anchor: typeof item.anchor === 'string' ? item.anchor : undefined,
+          level: clampNumber(item.level, 1, 4, 1),
+          order,
+        }))
+    : undefined
   const safeDetection: DetectionResult =
     detection && isGenre(detection.type)
       ? {
@@ -369,9 +393,15 @@ function sanitizeBook(input: unknown): Book | null {
     detection: safeDetection,
     excerpt: typeof source.excerpt === 'string' && source.excerpt.trim() ? source.excerpt : chapters[0].slice(0, 80),
     chapters,
-    format: source.format === 'md' || source.format === 'txt' ? source.format : 'txt',
+    chapterHtmls: Array.isArray(source.chapterHtmls)
+      ? source.chapterHtmls.filter((chapter): chapter is string => typeof chapter === 'string')
+      : undefined,
+    toc: safeToc,
+    tocSource: source.tocSource === 'nav' || source.tocSource === 'ncx' || source.tocSource === 'spine' || source.tocSource === 'fallback' ? source.tocSource : undefined,
+    format: source.format === 'md' || source.format === 'txt' || source.format === 'epub' ? source.format : 'txt',
     fileName: typeof source.fileName === 'string' ? source.fileName : undefined,
     fileSize: typeof source.fileSize === 'number' ? source.fileSize : undefined,
+    fileFingerprint: typeof source.fileFingerprint === 'string' ? source.fileFingerprint : undefined,
     importedAt: typeof source.importedAt === 'string' ? source.importedAt : undefined,
   }
 }
@@ -512,11 +542,12 @@ function App() {
   const [progressByBook, setProgressByBook] = useState<Record<string, ReadingProgress>>(initialStorage.progressByBook)
   const [importStatus, setImportStatus] = useState<{ tone: ImportTone; text: string }>({
     tone: 'info',
-    text: '本地 TXT / Markdown 可直接打开；正文不会上传。',
+    text: '本地 EPUB / TXT / Markdown 可直接打开；正文不会上传。',
   })
   const [persistenceStatus, setPersistenceStatus] = useState<{ tone: ImportTone; text: string } | null>(null)
   const [pendingIntensity, setPendingIntensity] = useState<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
+  const [isTocOpen, setIsTocOpen] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const modeExitRef = useRef<HTMLButtonElement | null>(null)
   const readingSurfaceRef = useRef<HTMLDivElement | null>(null)
@@ -528,6 +559,8 @@ function App() {
   const settings = settingsByBook[selectedBook.id] ?? getPreferenceDefaults()
   const progress = progressByBook[selectedBook.id]
   const progressPercent = getBookProgress(selectedBook, progress)
+  const currentChapterIndex = selectedBook.format === 'epub' ? Math.min(selectedBook.chapters.length - 1, Math.max(0, progress?.spineIndex ?? 0)) : 0
+  const currentChapterTitle = selectedBook.toc?.find((item) => item.spineIndex === currentChapterIndex)?.label ?? selectedBook.chapters[currentChapterIndex]?.slice(0, 18) ?? selectedBook.title
   const savedScrollTop = progress?.scrollTop ?? 0
   const selectedGenre = useMemo(() => {
     const detected = selectedBook.detection.confidence >= 0.7 ? selectedBook.detection.type : selectedBook.detection.fallbackType
@@ -582,7 +615,7 @@ function App() {
     window.setTimeout(() => {
       surface.scrollTop = savedScrollTop
     }, 0)
-  }, [savedScrollTop, selectedBook.id])
+  }, [currentChapterIndex, savedScrollTop, selectedBook.id])
 
   useEffect(() => {
     if (previousModeRef.current === settings.mode) {
@@ -665,7 +698,11 @@ function App() {
       return
     }
     const maxScroll = Math.max(1, surface.scrollHeight - surface.clientHeight)
-    const percent = Math.min(100, Math.max(0, (surface.scrollTop / maxScroll) * 100))
+    const chapterProgress = Math.min(100, Math.max(0, (surface.scrollTop / maxScroll) * 100))
+    const percent =
+      selectedBook.format === 'epub'
+        ? Math.min(100, ((currentChapterIndex + chapterProgress / 100) / Math.max(1, selectedBook.chapters.length)) * 100)
+        : chapterProgress
     if (progressSaveRef.current) {
       window.clearTimeout(progressSaveRef.current)
     }
@@ -675,7 +712,9 @@ function App() {
         [selectedBook.id]: {
           scrollTop: surface.scrollTop,
           percent,
-          chapterProgress: percent,
+          chapterProgress,
+          spineIndex: selectedBook.format === 'epub' ? currentChapterIndex : undefined,
+          chapterHref: selectedBook.toc?.find((item) => item.spineIndex === currentChapterIndex)?.href,
           updatedAt: new Date().toISOString(),
         },
       }))
@@ -690,12 +729,48 @@ function App() {
     const parsedBooks: Book[] = []
     for (const file of nextFiles) {
       const extension = file.name.split('.').pop()?.toLowerCase()
-      if (extension !== 'txt' && extension !== 'md' && extension !== 'markdown') {
-        setImportMessage('error', `无法打开 ${file.name}：当前本机解析仅支持 .txt、.md、.markdown；EPUB 将作为后续本地解析能力。`)
+      if (extension !== 'txt' && extension !== 'md' && extension !== 'markdown' && extension !== 'epub') {
+        setImportMessage('error', `无法打开 ${file.name}：当前本机解析支持 .epub、.txt、.md、.markdown。`)
         continue
       }
-      if (file.size > MAX_LOCAL_FILE_SIZE) {
-        setImportMessage('error', `无法打开 ${file.name}：文件超过 2.5MB，避免本地原型卡顿。`)
+      if (extension === 'epub' && file.size > MAX_EPUB_FILE_SIZE) {
+        setImportMessage('error', `无法打开 ${file.name}：EPUB 超过 60MB，当前本机原型为避免卡顿已拒绝。`)
+        continue
+      }
+      if (extension !== 'epub' && file.size > MAX_TEXT_FILE_SIZE) {
+        setImportMessage('error', `无法打开 ${file.name}：文本文件超过 2.5MB，避免本地原型卡顿。`)
+        continue
+      }
+      if (extension === 'epub') {
+        try {
+          const epub = await parseEpubFile(file)
+          const metadataText = [epub.title, epub.author, epub.language, epub.publisher, epub.description, ...epub.subjects, ...epub.toc.map((item) => item.label), ...epub.chapters.slice(0, 3).map((chapter) => chapter.text.slice(0, 1200))]
+            .filter(Boolean)
+            .join('\n')
+          const book: Book = {
+            id: epub.fileFingerprint,
+            title: epub.title,
+            author: epub.author,
+            category: `EPUB 本地书籍 · ${epub.tocSource.toUpperCase()} 目录`,
+            progress: 0,
+            chapterProgress: 0,
+            remaining: '本机保存',
+            format: 'epub',
+            fileName: file.name,
+            fileSize: file.size,
+            fileFingerprint: epub.fileFingerprint,
+            importedAt: new Date().toISOString(),
+            excerpt: epub.chapters[0]?.text.slice(0, 92) || epub.title,
+            chapters: epub.chapters.map((chapter) => chapter.text),
+            chapterHtmls: epub.chapters.map((chapter) => chapter.html),
+            toc: epub.toc,
+            tocSource: epub.tocSource,
+            detection: detectBookGenre(epub.title, metadataText, file.name),
+          }
+          parsedBooks.push(book)
+        } catch (error) {
+          setImportMessage('error', `无法打开 ${file.name}：${error instanceof Error ? error.message : 'EPUB 解析失败'}。`)
+        }
         continue
       }
       const rawText = await file.text()
@@ -739,7 +814,17 @@ function App() {
     setProgressByBook((current) => ({
       ...current,
       ...Object.fromEntries(
-        parsedBooks.map((book) => [book.id, { scrollTop: 0, percent: 0, chapterProgress: 0, updatedAt: new Date().toISOString() }]),
+        parsedBooks.map((book) => [
+          book.id,
+          {
+            scrollTop: 0,
+            percent: 0,
+            chapterProgress: 0,
+            spineIndex: book.format === 'epub' ? 0 : undefined,
+            chapterHref: book.toc?.[0]?.href,
+            updatedAt: new Date().toISOString(),
+          },
+        ]),
       ),
     }))
     setImportMessage('success', `已在本机打开 ${parsedBooks.length} 本书：${parsedBooks.map((book) => book.title).join('、')}。`)
@@ -784,7 +869,7 @@ function App() {
         ref={fileInputRef}
         className="sr-only"
         type="file"
-        accept=".txt,.md,.markdown,text/plain,text/markdown"
+        accept=".epub,.txt,.md,.markdown,application/epub+zip,text/plain,text/markdown"
         multiple
         tabIndex={-1}
         aria-hidden="true"
@@ -821,7 +906,7 @@ function App() {
           <button
             type="button"
             className="rail-button"
-            aria-label={label === '打开' ? '打开本地 TXT 或 Markdown 书籍' : label}
+            aria-label={label === '打开' ? '打开本地 EPUB、TXT 或 Markdown 书籍' : label}
             key={label}
             onClick={() => {
               if (label === '打开') {
@@ -851,18 +936,46 @@ function App() {
               aria-valuemax={100}
               aria-valuenow={progressPercent}
             >
-              <span>{selectedBook.chapters[0]?.slice(0, 18) ?? selectedBook.title}</span>
+              <span>{currentChapterTitle}</span>
               <div className="progress-line">
                 <span style={{ width: `${progressPercent}%` }} />
               </div>
             </div>
             <strong>{progressPercent}%</strong>
-            <button type="button" aria-label="目录将在后续版本提供" className="icon-button" disabled>
+            <button
+              type="button"
+              aria-label={selectedBook.format === 'epub' ? '打开或收起 EPUB 目录' : '当前书籍没有章节目录'}
+              className="icon-button"
+              disabled={selectedBook.format !== 'epub'}
+              onClick={() => setIsTocOpen((current) => !current)}
+            >
               <ListFilter size={20} aria-hidden="true" />
             </button>
           </header>
 
           {isDragging && <div className="drop-overlay">松开即可在本机打开书籍</div>}
+
+          {selectedBook.format === 'epub' && isTocOpen && (
+            <ChapterDrawer
+              book={selectedBook}
+              currentChapterIndex={currentChapterIndex}
+              onJump={(item) => {
+                setProgressByBook((current) => ({
+                  ...current,
+                  [selectedBook.id]: {
+                    scrollTop: 0,
+                    percent: Math.min(100, (item.spineIndex / Math.max(1, selectedBook.chapters.length)) * 100),
+                    chapterProgress: 0,
+                    spineIndex: item.spineIndex,
+                    chapterHref: item.href,
+                    updatedAt: new Date().toISOString(),
+                  },
+                }))
+                setIsTocOpen(false)
+                window.setTimeout(() => readingSurfaceRef.current?.focus(), 0)
+              }}
+            />
+          )}
 
           <div
             ref={readingSurfaceRef}
@@ -874,13 +987,18 @@ function App() {
           >
             <div className="book-kicker">
               <span>{selectedBook.author}</span>
-              <span>{genrePresets[selectedGenre].label}</span>
+              <span>{selectedBook.format === 'epub' ? `第 ${currentChapterIndex + 1} / ${selectedBook.chapters.length} 章` : genrePresets[selectedGenre].label}</span>
             </div>
             <h1>{selectedBook.title}</h1>
             <p className="lede">{selectedBook.excerpt}</p>
-            {selectedBook.chapters.map((paragraph, index) => (
-              <p key={`${selectedBook.id}-${index}`}>{paragraph}</p>
-            ))}
+            {selectedBook.format === 'epub' ? (
+              <section className="epub-chapter" aria-label={currentChapterTitle}>
+                <h2>{currentChapterTitle}</h2>
+                <div dangerouslySetInnerHTML={{ __html: selectedBook.chapterHtmls?.[currentChapterIndex] ?? selectedBook.chapters[currentChapterIndex] }} />
+              </section>
+            ) : (
+              selectedBook.chapters.map((paragraph, index) => <p key={`${selectedBook.id}-${index}`}>{paragraph}</p>)
+            )}
           </div>
 
           <footer className="minimal-controls" aria-label="阅读快捷控制">
@@ -941,7 +1059,7 @@ function App() {
         >
           <button type="button" className="local-open" onClick={() => fileInputRef.current?.click()}>
             <Upload size={20} aria-hidden="true" />
-            <span>选择 TXT / Markdown</span>
+            <span>选择 EPUB / TXT / Markdown</span>
           </button>
           <p className={`hint ${importStatus.tone === 'error' ? 'strong' : ''}`} role={importStatus.tone === 'error' ? 'alert' : 'status'} aria-live={importStatus.tone === 'error' ? 'assertive' : 'polite'}>
             {importStatus.text}
@@ -966,7 +1084,7 @@ function App() {
                 >
                   <strong>{book.title}</strong>
                   <span>
-                    {genrePresets[book.detection.type].label} · {bookProgress}% · {book.format === 'demo' ? '示例' : '本地'}
+                    {genrePresets[book.detection.type].label} · {bookProgress}% · {book.format === 'demo' ? '示例' : book.format.toUpperCase()}
                   </span>
                 </button>
               )
@@ -1108,6 +1226,50 @@ function AmbientBackground({ genre, intensity, paused }: { genre: BookGenre; int
       <div className="ambient-scrim" style={{ opacity: 0.48 + Math.min(intensity, 70) / 160 }} />
       <span className="sr-only">{preset.description}</span>
     </div>
+  )
+}
+
+function ChapterDrawer({
+  book,
+  currentChapterIndex,
+  onJump,
+}: {
+  book: Book
+  currentChapterIndex: number
+  onJump: (item: EpubTocItem) => void
+}) {
+  const sourceLabel = book.tocSource === 'nav' ? 'EPUB 3 Nav' : book.tocSource === 'ncx' ? 'EPUB 2 NCX' : 'Spine 自动目录'
+  const toc = book.toc?.length
+    ? book.toc
+    : book.chapters.map((chapter, index) => ({
+        id: `fallback-${index}`,
+        label: chapter.slice(0, 28) || `章节 ${index + 1}`,
+        href: String(index),
+        spineIndex: index,
+        level: 1,
+        order: index,
+      }))
+
+  return (
+    <nav className="chapter-drawer" aria-label="EPUB 章节目录">
+      <div className="chapter-drawer-meta">
+        <strong>章节目录</strong>
+        <span>{book.tocSource === 'spine' || book.tocSource === 'fallback' ? '未检测到目录，已按章节顺序生成' : sourceLabel}</span>
+      </div>
+      <div className="chapter-list">
+        {toc.map((item) => (
+          <button
+            type="button"
+            className={item.spineIndex === currentChapterIndex ? 'is-active' : ''}
+            key={`${item.id}-${item.order}`}
+            style={{ paddingLeft: `${12 + Math.min(item.level - 1, 3) * 14}px` }}
+            onClick={() => onJump(item)}
+          >
+            <span>{item.label}</span>
+          </button>
+        ))}
+      </div>
+    </nav>
   )
 }
 

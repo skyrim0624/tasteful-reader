@@ -7,14 +7,15 @@ import {
   Moon,
   Pause,
   Play,
-  Search,
   Settings,
   Sun,
   Type,
+  Upload,
+  X,
 } from 'lucide-react'
 import type { CSSProperties, ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 type BookGenre =
@@ -35,6 +36,7 @@ type BookGenre =
 type ThemeMode = 'dark' | 'light'
 type ReaderMode = 'regular' | 'immersive' | 'focus'
 type LineHeight = 'compact' | 'standard' | 'relaxed'
+type BookFormat = 'demo' | 'txt' | 'md'
 
 interface DetectionResult {
   type: BookGenre
@@ -54,6 +56,10 @@ interface Book {
   detection: DetectionResult
   excerpt: string
   chapters: string[]
+  format: BookFormat
+  fileName?: string
+  fileSize?: number
+  importedAt?: string
 }
 
 interface ReaderSettings {
@@ -68,6 +74,21 @@ interface ReaderSettings {
   manualType: BookGenre | null
 }
 
+interface ReadingProgress {
+  scrollTop: number
+  percent: number
+  chapterProgress: number
+  updatedAt: string
+}
+
+interface ReaderStorage {
+  version: 2
+  selectedBookId: string
+  importedBooks: Book[]
+  settingsByBook: Record<string, ReaderSettings>
+  progressByBook: Record<string, ReadingProgress>
+}
+
 const DEFAULT_SETTINGS: ReaderSettings = {
   theme: 'dark',
   mode: 'regular',
@@ -80,7 +101,10 @@ const DEFAULT_SETTINGS: ReaderSettings = {
   manualType: null,
 }
 
-const STORAGE_KEY = 'wanman-premium-reader-settings-v1'
+const STORAGE_KEY = 'wanman-premium-reader-local-v2'
+const LEGACY_STORAGE_KEY = 'wanman-premium-reader-settings-v1'
+const MAX_LOCAL_FILE_SIZE = 2.5 * 1024 * 1024
+const HIGH_INTENSITY_THRESHOLD = 55
 
 const genrePresets: Record<
   BookGenre,
@@ -95,7 +119,7 @@ const genrePresets: Record<
 > = {
   文学小说: {
     label: '文学',
-    description: '墨色山影与纸面光纤缓慢漂移',
+    description: '墨色山影、纸纤维、窗光与细雨低频漂移',
     palette: 'linear-gradient(135deg, #101820 0%, #22332c 45%, #6d5941 100%)',
     accent: '#77D6B6',
     secondary: '#C6A15B',
@@ -119,7 +143,7 @@ const genrePresets: Record<
   },
   奇幻: {
     label: '奇幻',
-    description: '森林剪影、月光雾层与微光尘埃',
+    description: '森林剪影、月光雾层与微光符文',
     palette: 'linear-gradient(135deg, #0b1718 0%, #17342d 48%, #425038 100%)',
     accent: '#9DDDBB',
     secondary: '#C6A15B',
@@ -199,7 +223,7 @@ const genrePresets: Record<
   },
 }
 
-const books: Book[] = [
+const sampleBooks: Book[] = [
   {
     id: 'far-mountain',
     title: '远山与星河',
@@ -208,6 +232,7 @@ const books: Book[] = [
     progress: 12,
     chapterProgress: 28,
     remaining: '42 分钟',
+    format: 'demo',
     detection: {
       type: '科幻',
       confidence: 0.86,
@@ -231,6 +256,7 @@ const books: Book[] = [
     progress: 47,
     chapterProgress: 63,
     remaining: '1 小时 18 分钟',
+    format: 'demo',
     detection: {
       type: '悬疑/犯罪',
       confidence: 0.78,
@@ -252,10 +278,11 @@ const books: Book[] = [
     progress: 31,
     chapterProgress: 44,
     remaining: '56 分钟',
+    format: 'demo',
     detection: {
       type: '商业/管理',
       confidence: 0.69,
-      reason: '副标题偏管理，但章节中有散文表达，先以建议类型呈现。',
+      reason: '副标题偏管理，但章节中有散文表达，先以低置信建议呈现。',
       fallbackType: '通用',
     },
     excerpt: '真正困难的决策，往往不是选择增长，而是选择什么不再增长。',
@@ -268,81 +295,409 @@ const books: Book[] = [
 ]
 
 const genreOptions = Object.keys(genrePresets) as BookGenre[]
-const swatchGenres: BookGenre[] = ['文学小说', '科幻', '奇幻', '历史']
+const swatchGenres: BookGenre[] = ['文学小说', '科幻', '奇幻', '历史', '悬疑/犯罪', '商业/管理']
+const lineHeights: LineHeight[] = ['compact', 'standard', 'relaxed']
+const readerModes: ReaderMode[] = ['regular', 'immersive', 'focus']
 
-function getInitialSettingsByBook(): Record<string, ReaderSettings> {
-  if (typeof window === 'undefined') {
-    return Object.fromEntries(books.map((book) => [book.id, { ...DEFAULT_SETTINGS }]))
-  }
+function isGenre(value: unknown): value is BookGenre {
+  return typeof value === 'string' && value in genrePresets
+}
 
-  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  const defaults = { ...DEFAULT_SETTINGS, reducedMotion: prefersReducedMotion }
-  const freshSettings = Object.fromEntries(books.map((book) => [book.id, { ...defaults }]))
+function clampNumber(value: unknown, min: number, max: number, fallback: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback
+}
 
-  const stored = window.localStorage.getItem(STORAGE_KEY)
-  if (!stored) {
-    return freshSettings
-  }
-
-  try {
-    const parsed = JSON.parse(stored) as Record<string, Partial<ReaderSettings>>
-    return Object.fromEntries(
-      books.map((book) => [book.id, { ...defaults, ...(parsed[book.id] ?? {}) }]),
-    ) as Record<string, ReaderSettings>
-  } catch {
-    return freshSettings
+function sanitizeSettings(input: unknown, prefersReducedMotion: boolean): ReaderSettings {
+  const source = input && typeof input === 'object' ? (input as Partial<ReaderSettings>) : {}
+  return {
+    theme: source.theme === 'light' || source.theme === 'dark' ? source.theme : DEFAULT_SETTINGS.theme,
+    mode: readerModes.includes(source.mode as ReaderMode) ? (source.mode as ReaderMode) : DEFAULT_SETTINGS.mode,
+    fontSize: clampNumber(source.fontSize, 17, 24, DEFAULT_SETTINGS.fontSize),
+    lineHeight: lineHeights.includes(source.lineHeight as LineHeight)
+      ? (source.lineHeight as LineHeight)
+      : DEFAULT_SETTINGS.lineHeight,
+    intensity: clampNumber(source.intensity, 0, 100, DEFAULT_SETTINGS.intensity),
+    motionEnabled: typeof source.motionEnabled === 'boolean' ? source.motionEnabled : DEFAULT_SETTINGS.motionEnabled,
+    reducedMotion: typeof source.reducedMotion === 'boolean' ? source.reducedMotion : prefersReducedMotion,
+    followType: typeof source.followType === 'boolean' ? source.followType : DEFAULT_SETTINGS.followType,
+    manualType: isGenre(source.manualType) ? source.manualType : null,
   }
 }
 
-function App() {
-  const [selectedBookId, setSelectedBookId] = useState(books[0].id)
-  const [settingsByBook, setSettingsByBook] = useState<Record<string, ReaderSettings>>(getInitialSettingsByBook)
+function sanitizeProgress(input: unknown): ReadingProgress {
+  const source = input && typeof input === 'object' ? (input as Partial<ReadingProgress>) : {}
+  return {
+    scrollTop: clampNumber(source.scrollTop, 0, 999999, 0),
+    percent: clampNumber(source.percent, 0, 100, 0),
+    chapterProgress: clampNumber(source.chapterProgress, 0, 100, 0),
+    updatedAt: typeof source.updatedAt === 'string' ? source.updatedAt : new Date().toISOString(),
+  }
+}
 
-  const selectedBook = useMemo(
-    () => books.find((book) => book.id === selectedBookId) ?? books[0],
-    [selectedBookId],
+function sanitizeBook(input: unknown): Book | null {
+  if (!input || typeof input !== 'object') {
+    return null
+  }
+  const source = input as Partial<Book>
+  if (typeof source.id !== 'string' || typeof source.title !== 'string' || !Array.isArray(source.chapters)) {
+    return null
+  }
+  const chapters = source.chapters.filter((chapter): chapter is string => typeof chapter === 'string' && chapter.trim().length > 0)
+  if (chapters.length === 0) {
+    return null
+  }
+  const detection = source.detection
+  const safeDetection: DetectionResult =
+    detection && isGenre(detection.type)
+      ? {
+          type: detection.type,
+          confidence: clampNumber(detection.confidence, 0, 1, 0.35),
+          reason: typeof detection.reason === 'string' ? detection.reason : '从本机文本片段低置信识别。',
+          fallbackType: isGenre(detection.fallbackType) ? detection.fallbackType : '通用',
+        }
+      : detectBookGenre(source.title, chapters.join('\n').slice(0, 4000), source.fileName)
+
+  return {
+    id: source.id,
+    title: source.title,
+    author: typeof source.author === 'string' ? source.author : '本地文件',
+    category: typeof source.category === 'string' ? source.category : '本地书籍',
+    progress: clampNumber(source.progress, 0, 100, 0),
+    chapterProgress: clampNumber(source.chapterProgress, 0, 100, 0),
+    remaining: typeof source.remaining === 'string' ? source.remaining : '本机保存',
+    detection: safeDetection,
+    excerpt: typeof source.excerpt === 'string' && source.excerpt.trim() ? source.excerpt : chapters[0].slice(0, 80),
+    chapters,
+    format: source.format === 'md' || source.format === 'txt' ? source.format : 'txt',
+    fileName: typeof source.fileName === 'string' ? source.fileName : undefined,
+    fileSize: typeof source.fileSize === 'number' ? source.fileSize : undefined,
+    importedAt: typeof source.importedAt === 'string' ? source.importedAt : undefined,
+  }
+}
+
+function getPreferenceDefaults() {
+  if (typeof window === 'undefined') {
+    return { ...DEFAULT_SETTINGS }
+  }
+  return {
+    ...DEFAULT_SETTINGS,
+    reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+    intensity: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 5 : DEFAULT_SETTINGS.intensity,
+  }
+}
+
+function getInitialStorage(): ReaderStorage {
+  const defaults = getPreferenceDefaults()
+  const settingsByBook = Object.fromEntries(sampleBooks.map((book) => [book.id, { ...defaults }]))
+  const progressByBook = Object.fromEntries(
+    sampleBooks.map((book) => [
+      book.id,
+      { scrollTop: 0, percent: book.progress, chapterProgress: book.chapterProgress, updatedAt: new Date().toISOString() },
+    ]),
   )
+  const fallback: ReaderStorage = {
+    version: 2,
+    selectedBookId: sampleBooks[0].id,
+    importedBooks: [],
+    settingsByBook,
+    progressByBook,
+  }
 
-  const settings = settingsByBook[selectedBook.id] ?? DEFAULT_SETTINGS
-  const selectedGenre = settings.followType
-    ? selectedBook.detection.confidence >= 0.7
-      ? selectedBook.detection.type
-      : selectedBook.detection.fallbackType
-    : settings.manualType ?? selectedBook.detection.type
-  const preset = genrePresets[selectedGenre]
+  if (typeof window === 'undefined') {
+    return fallback
+  }
+
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<ReaderStorage>
+      const importedBooks = Array.isArray(parsed.importedBooks)
+        ? parsed.importedBooks.map(sanitizeBook).filter((book): book is Book => Boolean(book))
+        : []
+      const allBooks = [...sampleBooks, ...importedBooks]
+      const safeSettings = Object.fromEntries(
+        allBooks.map((book) => [book.id, sanitizeSettings(parsed.settingsByBook?.[book.id], defaults.reducedMotion)]),
+      )
+      const safeProgress = Object.fromEntries(
+        allBooks.map((book) => [
+          book.id,
+          parsed.progressByBook?.[book.id]
+            ? sanitizeProgress(parsed.progressByBook[book.id])
+            : { scrollTop: 0, percent: book.progress, chapterProgress: book.chapterProgress, updatedAt: new Date().toISOString() },
+        ]),
+      )
+      return {
+        version: 2,
+        selectedBookId: allBooks.some((book) => book.id === parsed.selectedBookId) ? String(parsed.selectedBookId) : allBooks[0].id,
+        importedBooks,
+        settingsByBook: safeSettings,
+        progressByBook: safeProgress,
+      }
+    }
+
+    const legacyRaw = window.localStorage.getItem(LEGACY_STORAGE_KEY)
+    if (legacyRaw) {
+      const legacy = JSON.parse(legacyRaw) as Record<string, Partial<ReaderSettings>>
+      return {
+        ...fallback,
+        settingsByBook: Object.fromEntries(sampleBooks.map((book) => [book.id, sanitizeSettings(legacy[book.id], defaults.reducedMotion)])),
+      }
+    }
+  } catch {
+    return fallback
+  }
+
+  return fallback
+}
+
+function detectBookGenre(title: string, text: string, fileName = ''): DetectionResult {
+  const haystack = `${title} ${fileName} ${text.slice(0, 5000)}`.toLowerCase()
+  const rules: Array<[BookGenre, string[], string]> = [
+    ['科幻', ['星', '宇宙', '飞船', '轨道', '机器人', 'ai', '量子', '火星', '银河'], '命中宇宙、轨道或技术词。'],
+    ['悬疑/犯罪', ['证词', '凶手', '案件', '侦探', '尸体', '雨夜', '失踪', '犯罪', '谋杀'], '命中案件、证词或犯罪词。'],
+    ['奇幻', ['魔法', '龙', '森林', '符文', '王国', '精灵', '骑士', '月光'], '命中魔法、森林或符文词。'],
+    ['历史', ['王朝', '皇帝', '战役', '史记', '年代', '档案', '地图', '古城'], '命中年代、档案或史事词。'],
+    ['商业/管理', ['管理', '增长', '战略', '团队', '董事会', '商业', '市场', '组织'], '命中管理、战略或增长词。'],
+    ['文学小说', ['小说', '远山', '河流', '黄昏', '故乡', '命运', '街道', '记忆'], '命中文学叙事与场景词。'],
+    ['诗歌/散文', ['诗', '散文', '月色', '纸页', '风', '花', '雨', '春天'], '命中诗歌和散文意象词。'],
+    ['科普', ['科学', '细胞', '天文', '自然', '实验', '进化', '数学', '物理'], '命中科学、自然或实验词。'],
+  ]
+  const scored = rules
+    .map(([genre, words, reason]) => ({ genre, hits: words.filter((word) => haystack.includes(word)).length, reason }))
+    .sort((a, b) => b.hits - a.hits)
+  const best = scored[0]
+  if (!best || best.hits === 0) {
+    return { type: '通用', confidence: 0.28, reason: '本机识别未找到稳定类型信号，使用通用低干扰背景。', fallbackType: '通用' }
+  }
+  const confidence = Math.min(0.92, 0.42 + best.hits * 0.14)
+  return {
+    type: best.genre,
+    confidence,
+    reason: `${best.reason} 命中 ${best.hits} 个本机关键词。`,
+    fallbackType: confidence >= 0.7 ? best.genre : '通用',
+  }
+}
+
+function parseMarkdown(text: string) {
+  return text
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/[*_`>#-]/g, '')
+    .replace(/\[(.*?)\]\(.*?\)/g, '$1')
+}
+
+function splitTextIntoChapters(text: string) {
+  const clean = text.replace(/\r\n/g, '\n').trim()
+  const sections = clean
+    .split(/\n\s*(?=第[一二三四五六七八九十百0-9]+[章节回]|#{1,3}\s+)/)
+    .map((section) => section.trim())
+    .filter(Boolean)
+  const chunks = sections.length > 1 ? sections : clean.split(/\n{2,}/).filter(Boolean)
+  return chunks.length > 0 ? chunks.slice(0, 80) : [clean]
+}
+
+function getBookProgress(book: Book, progress?: ReadingProgress) {
+  return Math.round(progress?.percent ?? book.progress)
+}
+
+function App() {
+  const initialStorageRef = useRef<ReaderStorage | null>(null)
+  if (!initialStorageRef.current) {
+    initialStorageRef.current = getInitialStorage()
+  }
+  const initialStorage = initialStorageRef.current
+  const [importedBooks, setImportedBooks] = useState<Book[]>(initialStorage.importedBooks)
+  const [selectedBookId, setSelectedBookId] = useState(initialStorage.selectedBookId)
+  const [settingsByBook, setSettingsByBook] = useState<Record<string, ReaderSettings>>(initialStorage.settingsByBook)
+  const [progressByBook, setProgressByBook] = useState<Record<string, ReadingProgress>>(initialStorage.progressByBook)
+  const [importStatus, setImportStatus] = useState('本地 TXT / Markdown 可直接打开；正文不会上传。')
+  const [pendingIntensity, setPendingIntensity] = useState<number | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const readingSurfaceRef = useRef<HTMLDivElement | null>(null)
+  const progressSaveRef = useRef<number | null>(null)
+
+  const books = useMemo(() => [...sampleBooks, ...importedBooks], [importedBooks])
+  const selectedBook = useMemo(() => books.find((book) => book.id === selectedBookId) ?? books[0], [books, selectedBookId])
+  const settings = settingsByBook[selectedBook.id] ?? getPreferenceDefaults()
+  const progress = progressByBook[selectedBook.id]
+  const progressPercent = getBookProgress(selectedBook, progress)
+  const selectedGenre = useMemo(() => {
+    const detected = selectedBook.detection.confidence >= 0.7 ? selectedBook.detection.type : selectedBook.detection.fallbackType
+    return settings.followType ? detected : settings.manualType ?? detected
+  }, [selectedBook, settings.followType, settings.manualType])
+  const preset = genrePresets[selectedGenre] ?? genrePresets.通用
   const effectiveIntensity =
     settings.mode === 'focus'
       ? Math.min(settings.intensity, 12)
       : settings.mode === 'immersive'
-        ? Math.min(settings.intensity, 30)
+        ? Math.min(settings.intensity, 24)
         : settings.intensity
-  const motionIntensity =
-    settings.motionEnabled && !settings.reducedMotion ? effectiveIntensity : Math.min(effectiveIntensity, 5)
+  const motionIntensity = settings.motionEnabled ? (settings.reducedMotion ? Math.min(effectiveIntensity, 5) : effectiveIntensity) : 0
   const isQuiet = !settings.motionEnabled || settings.reducedMotion || motionIntensity <= 5
+  const intensityLabel = !settings.motionEnabled ? '已暂停' : settings.reducedMotion ? `生效 ${motionIntensity}%` : `${effectiveIntensity}%`
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settingsByBook))
-  }, [settingsByBook])
+    const payload: ReaderStorage = {
+      version: 2,
+      selectedBookId,
+      importedBooks,
+      settingsByBook,
+      progressByBook,
+    }
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
+    } catch (error) {
+      console.warn('Unable to persist local reader state', error)
+    }
+  }, [importedBooks, progressByBook, selectedBookId, settingsByBook])
+
+  useEffect(() => {
+    const surface = readingSurfaceRef.current
+    if (!surface) {
+      return
+    }
+    window.setTimeout(() => {
+      surface.scrollTop = progressByBook[selectedBook.id]?.scrollTop ?? 0
+    }, 0)
+  }, [progressByBook, selectedBook.id])
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape' && settings.mode !== 'regular') {
+        updateSetting('mode', 'regular')
+        readingSurfaceRef.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  })
 
   function updateSetting<Key extends keyof ReaderSettings>(key: Key, value: ReaderSettings[Key]) {
     setSettingsByBook((current) => ({
       ...current,
-      [selectedBook.id]: {
-        ...(current[selectedBook.id] ?? DEFAULT_SETTINGS),
-        [key]: value,
-      },
+      [selectedBook.id]: sanitizeSettings(
+        {
+          ...(current[selectedBook.id] ?? getPreferenceDefaults()),
+          [key]: value,
+        },
+        getPreferenceDefaults().reducedMotion,
+      ),
     }))
   }
 
   function chooseManualType(type: BookGenre) {
     setSettingsByBook((current) => ({
       ...current,
-      [selectedBook.id]: {
-        ...(current[selectedBook.id] ?? DEFAULT_SETTINGS),
-        followType: false,
-        manualType: type,
-      },
+      [selectedBook.id]: sanitizeSettings(
+        {
+          ...(current[selectedBook.id] ?? getPreferenceDefaults()),
+          followType: false,
+          manualType: type,
+        },
+        getPreferenceDefaults().reducedMotion,
+      ),
     }))
+  }
+
+  function handleIntensityChange(value: number) {
+    if (value > HIGH_INTENSITY_THRESHOLD && settings.intensity <= HIGH_INTENSITY_THRESHOLD) {
+      setPendingIntensity(value)
+      return
+    }
+    updateSetting('intensity', value)
+  }
+
+  function confirmHighIntensity() {
+    if (pendingIntensity !== null) {
+      updateSetting('intensity', pendingIntensity)
+      setPendingIntensity(null)
+    }
+  }
+
+  function saveScrollProgress() {
+    const surface = readingSurfaceRef.current
+    if (!surface) {
+      return
+    }
+    const maxScroll = Math.max(1, surface.scrollHeight - surface.clientHeight)
+    const percent = Math.min(100, Math.max(0, (surface.scrollTop / maxScroll) * 100))
+    if (progressSaveRef.current) {
+      window.clearTimeout(progressSaveRef.current)
+    }
+    progressSaveRef.current = window.setTimeout(() => {
+      setProgressByBook((current) => ({
+        ...current,
+        [selectedBook.id]: {
+          scrollTop: surface.scrollTop,
+          percent,
+          chapterProgress: percent,
+          updatedAt: new Date().toISOString(),
+        },
+      }))
+    }, 120)
+  }
+
+  async function importFiles(files: FileList | File[]) {
+    const nextFiles = Array.from(files)
+    if (nextFiles.length === 0) {
+      return
+    }
+    const parsedBooks: Book[] = []
+    for (const file of nextFiles) {
+      const extension = file.name.split('.').pop()?.toLowerCase()
+      if (extension !== 'txt' && extension !== 'md' && extension !== 'markdown') {
+        setImportStatus(`无法打开 ${file.name}：当前本机解析仅支持 .txt、.md、.markdown；EPUB 将作为后续本地解析能力。`)
+        continue
+      }
+      if (file.size > MAX_LOCAL_FILE_SIZE) {
+        setImportStatus(`无法打开 ${file.name}：文件超过 2.5MB，避免本地原型卡顿。`)
+        continue
+      }
+      const rawText = await file.text()
+      const content = extension === 'txt' ? rawText : parseMarkdown(rawText)
+      if (!content.trim()) {
+        setImportStatus(`无法打开 ${file.name}：文件为空或没有可读正文。`)
+        continue
+      }
+      const title = file.name.replace(/\.(txt|md|markdown)$/i, '')
+      const chapters = splitTextIntoChapters(content)
+      const book: Book = {
+        id: `local-${file.name}-${file.size}-${file.lastModified}`.replace(/[^a-zA-Z0-9-]/g, '-'),
+        title,
+        author: '本地文件',
+        category: extension === 'txt' ? 'TXT 本地书籍' : 'Markdown 本地书籍',
+        progress: 0,
+        chapterProgress: 0,
+        remaining: '本机保存',
+        format: extension === 'txt' ? 'txt' : 'md',
+        fileName: file.name,
+        fileSize: file.size,
+        importedAt: new Date().toISOString(),
+        excerpt: chapters[0].slice(0, 92),
+        chapters,
+        detection: detectBookGenre(title, content, file.name),
+      }
+      parsedBooks.push(book)
+    }
+    if (parsedBooks.length === 0) {
+      return
+    }
+    setImportedBooks((current) => {
+      const withoutDuplicates = current.filter((book) => !parsedBooks.some((nextBook) => nextBook.id === book.id))
+      return [...parsedBooks, ...withoutDuplicates]
+    })
+    setSelectedBookId(parsedBooks[0].id)
+    setSettingsByBook((current) => ({
+      ...current,
+      ...Object.fromEntries(parsedBooks.map((book) => [book.id, { ...getPreferenceDefaults() }])),
+    }))
+    setProgressByBook((current) => ({
+      ...current,
+      ...Object.fromEntries(
+        parsedBooks.map((book) => [book.id, { scrollTop: 0, percent: 0, chapterProgress: 0, updatedAt: new Date().toISOString() }]),
+      ),
+    }))
+    setImportStatus(`已在本机打开 ${parsedBooks.length} 本书：${parsedBooks.map((book) => book.title).join('、')}。`)
   }
 
   const appStyle = {
@@ -356,7 +711,7 @@ function App() {
 
   const railItems: Array<[string, LucideIcon]> = [
     ['书架', BookOpen],
-    ['发现', Search],
+    ['打开', Upload],
     ['书签', Bookmark],
     ['笔记', Highlighter],
     ['设置', Settings],
@@ -366,18 +721,58 @@ function App() {
     <main
       className={`reader-app theme-${settings.theme} mode-${settings.mode} scene-${preset.scene} ${
         isQuiet ? 'is-quiet-motion' : ''
-      }`}
+      } ${settings.intensity > HIGH_INTENSITY_THRESHOLD ? 'is-high-intensity' : ''}`}
       style={appStyle}
+      onDragOver={(event) => {
+        event.preventDefault()
+        setIsDragging(true)
+      }}
+      onDragLeave={() => setIsDragging(false)}
+      onDrop={(event) => {
+        event.preventDefault()
+        setIsDragging(false)
+        void importFiles(event.dataTransfer.files)
+      }}
     >
       <AmbientBackground genre={selectedGenre} intensity={motionIntensity} paused={isQuiet} />
+      <input
+        ref={fileInputRef}
+        className="sr-only"
+        type="file"
+        accept=".txt,.md,.markdown,text/plain,text/markdown"
+        multiple
+        onChange={(event) => {
+          if (event.target.files) {
+            void importFiles(event.target.files)
+          }
+          event.currentTarget.value = ''
+        }}
+      />
+
+      {settings.mode !== 'regular' && (
+        <button type="button" className="mode-exit" onClick={() => updateSetting('mode', 'regular')}>
+          <X size={18} aria-hidden="true" />
+          <span>退出{settings.mode === 'focus' ? '专注' : '沉浸'}</span>
+        </button>
+      )}
 
       <aside className="library-rail" aria-label="书架导航">
         <div className="brand">
           <BookOpen size={29} aria-hidden="true" />
-          <strong>沉浸阅读</strong>
+          <strong>本地沉浸阅读</strong>
         </div>
         {railItems.map(([label, Icon]) => (
-          <button type="button" className="rail-button" aria-label={label} key={label}>
+          <button
+            type="button"
+            className="rail-button"
+            aria-label={label === '打开' ? '打开本地 TXT 或 Markdown 书籍' : label}
+            key={label}
+            onClick={() => {
+              if (label === '打开') {
+                fileInputRef.current?.click()
+              }
+            }}
+          >
             <Icon size={22} aria-hidden="true" />
             <span>{label}</span>
           </button>
@@ -385,40 +780,56 @@ function App() {
       </aside>
 
       <section className="reader-stage" aria-label="沉浸阅读区">
-        <LightPreview book={selectedBook} />
+        <LightPreview book={selectedBook} progress={progressPercent} />
 
         <article className="reading-card" aria-label={`${selectedBook.title} 正文`}>
           <header className="reader-topbar">
-            <button type="button" aria-label="返回书架" className="icon-button">
-              <BookOpen size={20} aria-hidden="true" />
+            <button type="button" aria-label="打开本地书籍" className="icon-button" onClick={() => fileInputRef.current?.click()}>
+              <Upload size={20} aria-hidden="true" />
             </button>
-            <div className="chapter-progress" aria-label={`阅读进度 ${selectedBook.progress}%`}>
-              <span>第一章 远山与星河</span>
+            <div
+              className="chapter-progress"
+              role="progressbar"
+              aria-label={`阅读进度 ${progressPercent}%`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={progressPercent}
+            >
+              <span>{selectedBook.chapters[0]?.slice(0, 18) ?? selectedBook.title}</span>
               <div className="progress-line">
-                <span style={{ width: `${selectedBook.progress}%` }} />
+                <span style={{ width: `${progressPercent}%` }} />
               </div>
             </div>
-            <strong>{selectedBook.progress}%</strong>
-            <button type="button" aria-label="打开目录" className="icon-button">
+            <strong>{progressPercent}%</strong>
+            <button type="button" aria-label="目录将在后续版本提供" className="icon-button" disabled>
               <ListFilter size={20} aria-hidden="true" />
             </button>
           </header>
 
-          <div className="reading-surface">
+          {isDragging && <div className="drop-overlay">松开即可在本机打开书籍</div>}
+
+          <div
+            ref={readingSurfaceRef}
+            className="reading-surface"
+            role="region"
+            aria-label="正文，可滚动。按 Escape 可退出沉浸或专注模式。"
+            tabIndex={0}
+            onScroll={saveScrollProgress}
+          >
             <div className="book-kicker">
               <span>{selectedBook.author}</span>
               <span>{genrePresets[selectedGenre].label}</span>
             </div>
             <h1>{selectedBook.title}</h1>
             <p className="lede">{selectedBook.excerpt}</p>
-            {selectedBook.chapters.map((paragraph) => (
-              <p key={paragraph}>{paragraph}</p>
+            {selectedBook.chapters.map((paragraph, index) => (
+              <p key={`${selectedBook.id}-${index}`}>{paragraph}</p>
             ))}
           </div>
 
           <footer className="minimal-controls" aria-label="阅读快捷控制">
-            <button type="button" aria-label="目录" className="icon-button">
-              <ListFilter size={19} aria-hidden="true" />
+            <button type="button" aria-label="打开本地书籍" className="icon-button" onClick={() => fileInputRef.current?.click()}>
+              <Upload size={19} aria-hidden="true" />
             </button>
             <button
               type="button"
@@ -428,9 +839,6 @@ function App() {
             >
               {settings.theme === 'dark' ? <Moon size={19} aria-hidden="true" /> : <Sun size={19} aria-hidden="true" />}
             </button>
-            <button type="button" aria-label="字体设置" className="icon-button">
-              <Type size={19} aria-hidden="true" />
-            </button>
             <button
               type="button"
               aria-label={settings.motionEnabled ? '暂停动态背景' : '恢复动态背景'}
@@ -439,37 +847,69 @@ function App() {
             >
               {settings.motionEnabled ? <Pause size={19} aria-hidden="true" /> : <Play size={19} aria-hidden="true" />}
             </button>
+            {settings.mode !== 'regular' ? (
+              <button type="button" className="exit-button" onClick={() => updateSetting('mode', 'regular')}>
+                退出
+              </button>
+            ) : (
+              <button type="button" aria-label="字体设置在右侧面板调整" className="icon-button" disabled>
+                <Type size={19} aria-hidden="true" />
+              </button>
+            )}
           </footer>
         </article>
 
         <div className="ambient-dock" aria-label="动态背景强度">
-          <span>动态背景强度</span>
+          <span>{!settings.motionEnabled ? '动态背景已暂停' : settings.reducedMotion ? '减少动态生效' : '动态背景强度'}</span>
           <input
             type="range"
             min="0"
             max="100"
             value={settings.intensity}
-            aria-label="动态背景强度百分比"
-            onChange={(event) => updateSetting('intensity', Number(event.target.value))}
+            aria-label="底部快捷动态背景强度"
+            onChange={(event) => handleIntensityChange(Number(event.target.value))}
           />
-          <strong>{effectiveIntensity}%</strong>
+          <strong>{intensityLabel}</strong>
         </div>
       </section>
 
       <aside className="control-panel" aria-label="阅读控制">
+        <PanelSection
+          title="本地打开"
+          action={
+            <button type="button" className="mini-action" onClick={() => fileInputRef.current?.click()}>
+              <Upload size={16} aria-hidden="true" />
+              打开
+            </button>
+          }
+        >
+          <button type="button" className="local-open" onClick={() => fileInputRef.current?.click()}>
+            <Upload size={20} aria-hidden="true" />
+            <span>选择 TXT / Markdown</span>
+          </button>
+          <p className="hint" role="status" aria-live="polite">
+            {importStatus}
+          </p>
+        </PanelSection>
+
         <PanelSection title="正在阅读">
           <div className="book-switcher">
-            {books.map((book) => (
-              <button
-                type="button"
-                className={book.id === selectedBook.id ? 'is-active' : ''}
-                key={book.id}
-                onClick={() => setSelectedBookId(book.id)}
-              >
-                <strong>{book.title}</strong>
-                <span>{genrePresets[book.detection.type].label} · {book.progress}%</span>
-              </button>
-            ))}
+            {books.map((book) => {
+              const bookProgress = getBookProgress(book, progressByBook[book.id])
+              return (
+                <button
+                  type="button"
+                  className={book.id === selectedBook.id ? 'is-active' : ''}
+                  key={book.id}
+                  onClick={() => setSelectedBookId(book.id)}
+                >
+                  <strong>{book.title}</strong>
+                  <span>
+                    {genrePresets[book.detection.type].label} · {bookProgress}% · {book.format === 'demo' ? '示例' : '本地'}
+                  </span>
+                </button>
+              )
+            })}
           </div>
         </PanelSection>
 
@@ -488,7 +928,7 @@ function App() {
             {swatchGenres.map((genre) => (
               <button
                 type="button"
-                className={`genre-card ${genre === selectedGenre ? 'is-selected' : ''}`}
+                className={`genre-card scene-${genrePresets[genre].scene} ${genre === selectedGenre ? 'is-selected' : ''}`}
                 key={genre}
                 onClick={() => chooseManualType(genre)}
                 style={{ '--swatch': genrePresets[genre].palette } as CSSProperties}
@@ -510,37 +950,40 @@ function App() {
           )}
         </PanelSection>
 
-        <PanelSection title={`强度 ${effectiveIntensity}%`}>
+        <PanelSection title={`强度 ${intensityLabel}`}>
           <input
             type="range"
             min="0"
             max="100"
             value={settings.intensity}
-            aria-label="动态背景强度"
-            onChange={(event) => updateSetting('intensity', Number(event.target.value))}
+            aria-label="设置面板动态背景强度"
+            onChange={(event) => handleIntensityChange(Number(event.target.value))}
           />
           <div className="range-labels">
             <span>0%</span>
             <span>100%</span>
           </div>
-          {settings.intensity > 55 && <p className="hint strong">高强度仅适合预览，长时间阅读建议降至 30% 以下。</p>}
+          {pendingIntensity !== null && (
+            <div className="confirm-box" role="alert">
+              <p>高强度只用于短时预览，正文遮罩会自动增强。确认使用 {pendingIntensity}%？</p>
+              <button type="button" onClick={confirmHighIntensity}>
+                确认预览
+              </button>
+              <button type="button" onClick={() => setPendingIntensity(null)}>
+                取消
+              </button>
+            </div>
+          )}
+          {settings.intensity > HIGH_INTENSITY_THRESHOLD && <p className="hint strong">高强度已启用增强正文遮罩，长时间阅读建议降至 30% 以下。</p>}
         </PanelSection>
 
         <PanelSection title="亮 / 暗">
           <div className="segmented" role="group" aria-label="主题">
-            <button
-              type="button"
-              className={settings.theme === 'light' ? 'is-active' : ''}
-              onClick={() => updateSetting('theme', 'light')}
-            >
+            <button type="button" className={settings.theme === 'light' ? 'is-active' : ''} onClick={() => updateSetting('theme', 'light')}>
               <Sun size={18} aria-hidden="true" />
               <span>亮</span>
             </button>
-            <button
-              type="button"
-              className={settings.theme === 'dark' ? 'is-active' : ''}
-              onClick={() => updateSetting('theme', 'dark')}
-            >
+            <button type="button" className={settings.theme === 'dark' ? 'is-active' : ''} onClick={() => updateSetting('theme', 'dark')}>
               <Moon size={18} aria-hidden="true" />
               <span>暗</span>
             </button>
@@ -568,13 +1011,8 @@ function App() {
 
         <PanelSection title="行间距">
           <div className="segmented" role="group" aria-label="行距">
-            {(['compact', 'standard', 'relaxed'] as LineHeight[]).map((value) => (
-              <button
-                type="button"
-                className={settings.lineHeight === value ? 'is-active' : ''}
-                key={value}
-                onClick={() => updateSetting('lineHeight', value)}
-              >
+            {lineHeights.map((value) => (
+              <button type="button" className={settings.lineHeight === value ? 'is-active' : ''} key={value} onClick={() => updateSetting('lineHeight', value)}>
                 <span>{value === 'compact' ? '紧' : value === 'standard' ? '中' : '舒'}</span>
               </button>
             ))}
@@ -583,23 +1021,14 @@ function App() {
 
         <PanelSection title="阅读模式">
           <div className="mode-grid" role="group" aria-label="阅读模式">
-            {[
-              ['regular', '常规'],
-              ['immersive', '沉浸'],
-              ['focus', '专注'],
-            ].map(([mode, label]) => (
-              <button
-                type="button"
-                className={settings.mode === mode ? 'is-active' : ''}
-                key={mode}
-                onClick={() => updateSetting('mode', mode as ReaderMode)}
-              >
-                {label}
+            {readerModes.map((mode) => (
+              <button type="button" className={settings.mode === mode ? 'is-active' : ''} key={mode} onClick={() => updateSetting('mode', mode)}>
+                {mode === 'regular' ? '常规' : mode === 'immersive' ? '沉浸' : '专注'}
               </button>
             ))}
           </div>
           <Toggle checked={settings.reducedMotion} label="减少动态" onChange={(checked) => updateSetting('reducedMotion', checked)} />
-          <p className="hint">专注模式会自动把背景降噪到 12% 以下，并隐藏非必要控制。</p>
+          <p className="hint">沉浸和专注模式保留可见退出入口；Escape 也可返回常规。</p>
         </PanelSection>
       </aside>
     </main>
@@ -611,16 +1040,17 @@ function AmbientBackground({ genre, intensity, paused }: { genre: BookGenre; int
   return (
     <div className={`ambient-background ${paused ? 'is-paused' : ''}`} aria-hidden="true">
       <div className="ambient-gradient" />
+      <div className="ambient-motif" />
       <div className="ambient-map" />
       <div className="ambient-orbits" />
       <div className="ambient-fibers" />
-      <div className="ambient-scrim" style={{ opacity: 0.42 + Math.min(intensity, 55) / 180 }} />
+      <div className="ambient-scrim" style={{ opacity: 0.48 + Math.min(intensity, 70) / 160 }} />
       <span className="sr-only">{preset.description}</span>
     </div>
   )
 }
 
-function LightPreview({ book }: { book: Book }) {
+function LightPreview({ book, progress }: { book: Book; progress: number }) {
   return (
     <aside className="light-preview" aria-hidden="true">
       <div className="preview-top" />
@@ -628,7 +1058,7 @@ function LightPreview({ book }: { book: Book }) {
       <p>{book.excerpt}</p>
       <p>{book.chapters[0]}</p>
       <div className="preview-progress">
-        <span style={{ width: `${book.progress}%` }} />
+        <span style={{ width: `${progress}%` }} />
       </div>
     </aside>
   )
@@ -664,14 +1094,7 @@ function Toggle({
   onChange: (checked: boolean) => void
 }) {
   return (
-    <button
-      type="button"
-      className={`toggle ${checked ? 'is-on' : ''}`}
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      onClick={() => onChange(!checked)}
-    >
+    <button type="button" className={`toggle ${checked ? 'is-on' : ''}`} role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}>
       <span />
     </button>
   )
